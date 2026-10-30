@@ -1,0 +1,963 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "common/FieldData.h"
+#include "common/FastMem.h"
+
+#include <simdjson.h>
+#include <string.h>
+#include <algorithm>
+#include <cstdint>
+#include <iosfwd>
+#include <optional>
+#include <type_traits>
+
+#include "arrow/api.h"
+#include "arrow/array/array_base.h"
+#include "arrow/array/array_binary.h"
+#include "arrow/array/array_nested.h"
+#include "arrow/array/array_primitive.h"
+#include "bitset/detail/element_wise.h"
+#include "bitset/detail/popcount.h"
+#include "common/Array.h"
+#include "common/ArrayValue.h"
+#include "common/ColumnarArrayChunkBuilder.h"
+#include "common/EasyAssert.h"
+#include "common/FieldDataInterface.h"
+#include "common/Geometry.h"
+#include "common/Json.h"
+#include "pb/schema.pb.h"
+#include "simdjson/padded_string.h"
+
+namespace milvus {
+
+FieldData<ArrayValue>::FieldData(
+    proto::schema::TypeSchema array_type,
+    bool nullable,
+    int64_t num_rows,
+    const std::optional<DefaultValueType>& default_value)
+    : Base(1, DataType::ARRAY, nullable, num_rows),
+      array_type_(std::make_shared<const proto::schema::TypeSchema>(
+          std::move(array_type))) {
+    ColumnarArrayChunk::ValidateArrayType(*array_type_);
+    AssertInfo(nullable, "default value field data must be nullable");
+    AssertInfo(!default_value.has_value(),
+               "native-list ARRAY default values are not supported");
+
+    ScalarFieldProto null_row;
+    const auto null_value = ArrayValue::FromProto(null_row, array_type_);
+    std::fill(data_.begin(), data_.end(), null_value);
+    std::fill(valid_data_.begin(), valid_data_.end(), 0x00);
+    null_count_ = num_rows;
+    length_ = num_rows;
+}
+
+void
+FieldData<ArrayValue>::FillFieldData(
+    const std::shared_ptr<arrow::Array> array) {
+    AssertInfo(array != nullptr,
+               "null Arrow array for native-list ARRAY field");
+    AssertInfo(array->type_id() == arrow::Type::BINARY ||
+                   array->type_id() == arrow::Type::LIST,
+               "native-list ARRAY field expects Arrow BinaryArray or "
+               "ListArray, got {}",
+               array->type()->ToString());
+    auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+    auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(array);
+
+    const auto element_count = array->length();
+    if (element_count == 0) {
+        return;
+    }
+
+    std::vector<ArrayValue> values;
+    if (list_array != nullptr) {
+        values = ArrowListToArrayValues(*list_array, array_type_);
+    } else {
+        values.reserve(element_count);
+        for (int64_t index = 0; index < element_count; ++index) {
+            ScalarFieldProto row;
+            if (binary_array->IsValid(index)) {
+                const auto value = binary_array->GetView(index);
+                AssertInfo(row.ParseFromArray(value.data(), value.size()),
+                           "failed to parse native-list ARRAY row {}",
+                           index);
+                AssertInfo(
+                    row.data_case() != ScalarFieldProto::DATA_NOT_SET,
+                    "valid native-list ARRAY row {} has no ScalarField payload",
+                    index);
+            }
+            values.emplace_back(ArrayValue::FromProto(row, array_type_));
+        }
+    }
+
+    if (this->nullable_) {
+        this->null_count_ += array->null_count();
+        return Base::FillFieldData(values.data(),
+                                   array->null_bitmap_data(),
+                                   element_count,
+                                   array->offset());
+    }
+
+    AssertInfo(array->null_count() == 0,
+               "non-nullable native-list ARRAY field contains {} null rows",
+               array->null_count());
+    return Base::FillFieldData(values.data(), element_count);
+}
+
+int64_t
+FieldData<ArrayValue>::DataSize() const {
+    int64_t data_size = 0;
+    for (size_t offset = 0; offset < this->length(); ++offset) {
+        data_size += static_cast<int64_t>(this->data_[offset].byte_size());
+    }
+    return data_size;
+}
+
+int64_t
+FieldData<ArrayValue>::DataSize(ssize_t offset) const {
+    AssertInfo(offset >= 0 && offset < this->get_num_rows(),
+               "field data subscript out of range");
+    AssertInfo(static_cast<size_t>(offset) < this->length(),
+               "subscript position doesn't have a value");
+    return static_cast<int64_t>(this->data_[offset].byte_size());
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(const void* source,
+                                                       ssize_t element_count) {
+    AssertInfo(!nullable_,
+               "need to fill valid_data, use the 3-argument version instead");
+
+    if (element_count == 0) {
+        return;
+    }
+
+    std::lock_guard lck(tell_mutex_);
+    if (length_ + element_count > get_num_rows()) {
+        resize_field_data(length_ + element_count);
+    }
+    auto source_data = static_cast<const Type*>(source);
+    auto target_data = data_.data() + length_ * dim_;
+    auto count = element_count * dim_;
+    if constexpr (std::is_trivially_copyable_v<Type>) {
+        milvus::fastmem::FastMemcpy(
+            target_data, source_data, count * sizeof(Type));
+    } else {
+        std::copy_n(source_data, count, target_data);
+    }
+    length_ += element_count;
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    const void* field_data,
+    const uint8_t* valid_data,
+    ssize_t element_count,
+    ssize_t offset) {
+    AssertInfo(
+        nullable_,
+        "no need to fill valid_data, use the 2-argument version instead");
+    if (element_count == 0) {
+        return;
+    }
+
+    std::lock_guard lck(tell_mutex_);
+    if (length_ + element_count > get_num_rows()) {
+        resize_field_data(length_ + element_count);
+    }
+    auto source_data = static_cast<const Type*>(field_data);
+    auto target_data = data_.data() + length_ * dim_;
+    auto count = element_count * dim_;
+    if constexpr (std::is_trivially_copyable_v<Type>) {
+        milvus::fastmem::FastMemcpy(
+            target_data, source_data, count * sizeof(Type));
+    } else {
+        std::copy_n(source_data, count, target_data);
+    }
+
+    // Note: if 'nullable == true` and valid_data is nullptr
+    // means null_count == 0, will fill it with 0xFF
+    if (valid_data != nullptr) {
+        bitset::detail::ElementWiseBitsetPolicy<uint8_t>::op_copy(
+            valid_data, offset, valid_data_.data(), length_, element_count);
+    }
+
+    length_ += element_count;
+}
+
+template <typename ArrayType, arrow::Type::type ArrayDataType>
+std::pair<const void*, int64_t>
+GetDataInfoFromArray(const std::shared_ptr<arrow::Array> array) {
+    AssertInfo(array->type()->id() == ArrayDataType,
+               "inconsistent data type, expected {}, actual {}",
+               ArrayDataType,
+               array->type()->id());
+    auto typed_array = std::dynamic_pointer_cast<ArrayType>(array);
+    auto element_count = array->length();
+
+    return std::make_pair(typed_array->raw_values(), element_count);
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    const std::shared_ptr<arrow::ChunkedArray> arrays) {
+    AssertInfo(arrays != nullptr, "null arrow chunked array");
+    auto element_count = arrays->length();
+    if (element_count == 0) {
+        return;
+    }
+    for (const auto& array : arrays->chunks()) {
+        FillFieldData(array);
+    }
+}
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataImpl<Type, is_type_entire_row>::FillFieldData(
+    const std::shared_ptr<arrow::Array> array) {
+    AssertInfo(array != nullptr, "null arrow array");
+    auto element_count = array->length();
+    if (element_count == 0) {
+        return;
+    }
+    if (!(nullable_ && IsVectorDataType(data_type_))) {
+        null_count_ += array->null_count();
+    }
+    switch (data_type_) {
+        case DataType::BOOL: {
+            if (!(array->type()->id() == arrow::Type::type::BOOL)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            auto bool_array =
+                std::dynamic_pointer_cast<arrow::BooleanArray>(array);
+            FixedVector<bool> values(element_count);
+            for (size_t index = 0; index < element_count; ++index) {
+                values[index] = bool_array->Value(index);
+            }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     bool_array->null_bitmap_data(),
+                                     element_count,
+                                     bool_array->offset());
+            }
+            return FillFieldData(values.data(), element_count);
+        }
+        case DataType::INT8: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::Int8Array, arrow::Type::type::INT8>(
+                    array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::INT16: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::Int16Array,
+                                     arrow::Type::type::INT16>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::INT32: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::Int32Array,
+                                     arrow::Type::type::INT32>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::INT64: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::Int64Array,
+                                     arrow::Type::type::INT64>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::FLOAT: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::FloatArray,
+                                     arrow::Type::type::FLOAT>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::DOUBLE: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::DoubleArray,
+                                     arrow::Type::type::DOUBLE>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::TIMESTAMPTZ: {
+            auto array_info =
+                GetDataInfoFromArray<arrow::Int64Array,
+                                     arrow::Type::type::INT64>(array);
+            if (nullable_) {
+                return FillFieldData(array_info.first,
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::STRING:
+        case DataType::VARCHAR: {
+            if (!(array->type()->id() == arrow::Type::type::STRING)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            auto string_array =
+                std::dynamic_pointer_cast<arrow::StringArray>(array);
+            return FillFieldData(string_array);
+        }
+        case DataType::TEXT: {
+            // V3 storage: TEXT is stored as BINARY (LOBReference in parquet)
+            // Insert path: TEXT arrives as STRING
+            if (!(array->type()->id() == arrow::Type::type::STRING ||
+                  array->type()->id() == arrow::Type::type::BINARY)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            std::vector<std::string> values(element_count);
+            if (array->type()->id() == arrow::Type::type::STRING) {
+                auto string_array =
+                    std::dynamic_pointer_cast<arrow::StringArray>(array);
+                for (size_t index = 0; index < element_count; ++index) {
+                    values[index] = string_array->GetString(index);
+                }
+            } else {
+                auto binary_array =
+                    std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+                for (size_t index = 0; index < element_count; ++index) {
+                    auto sv = binary_array->GetView(index);
+                    values[index].assign(sv.data(), sv.size());
+                }
+            }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(values.data(), element_count);
+        }
+        case DataType::JSON: {
+            // The code here is not referenced.
+            // A subclass named FieldDataJsonImpl is implemented, which overloads this function.
+            if (!(array->type()->id() == arrow::Type::type::BINARY)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            auto json_array =
+                std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+            std::vector<Json> values(element_count);
+            for (size_t index = 0; index < element_count; ++index) {
+                values[index] =
+                    Json(simdjson::padded_string(json_array->GetString(index)));
+            }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            return FillFieldData(values.data(), element_count);
+        }
+        case DataType::GEOMETRY: {
+            if (!(array->type()->id() == arrow::Type::type::BINARY)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            auto geometry_array =
+                std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+            AssertInfo(geometry_array != nullptr,
+                       "null geometry arrow binary array");
+            if constexpr (std::is_same_v<Type, std::string>) {
+                std::vector<std::string> values(element_count);
+                for (size_t index = 0; index < element_count; ++index) {
+                    auto sv = geometry_array->GetView(index);
+                    values[index].assign(sv.data(), sv.size());
+                }
+                if (nullable_) {
+                    return FillFieldData(values.data(),
+                                         array->null_bitmap_data(),
+                                         element_count,
+                                         array->offset());
+                }
+                return FillFieldData(values.data(), element_count);
+            }
+            ThrowInfo(DataTypeInvalid,
+                      "GEOMETRY arrow data must be filled into string-backed "
+                      "FieldData");
+        }
+        case DataType::ARRAY: {
+            auto array_array =
+                std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+            if (array_array == nullptr &&
+                array->type_id() == arrow::Type::LIST) {
+                ThrowInfo(ErrorCode::NotImplemented,
+                          "scalar index build on native-list ARRAY is not "
+                          "supported yet");
+            }
+            AssertInfo(array_array != nullptr,
+                       "legacy ARRAY field expects Arrow BinaryArray");
+            std::vector<Array> values(element_count);
+            int null_number = 0;
+            for (size_t index = 0; index < element_count; ++index) {
+                auto str = array_array->GetString(index);
+                if (str.empty()) {
+                    null_number++;
+                    continue;
+                }
+                ScalarFieldProto field_data;
+                auto success = field_data.ParseFromString(str);
+                if (!(success)) {
+                    ThrowInfo(ErrorCode::DataFormatBroken,
+                              "parse from string failed");
+                }
+                if (field_data.valid_data_size() != 0) {
+                    ThrowInfo(ErrorCode::NotImplemented,
+                              "scalar index build on element-nullable ARRAY "
+                              "is not supported yet");
+                }
+                values[index] = Array(field_data);
+            }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     array->null_bitmap_data(),
+                                     element_count,
+                                     array->offset());
+            }
+            AssertInfo(null_number == 0, "get empty string when not nullable");
+            return FillFieldData(values.data(), element_count);
+        }
+        case DataType::VECTOR_FLOAT:
+        case DataType::VECTOR_FLOAT16:
+        case DataType::VECTOR_BFLOAT16:
+        case DataType::VECTOR_INT8:
+        case DataType::VECTOR_BINARY: {
+            if (nullable_) {
+                auto binary_array =
+                    std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+                AssertInfo(binary_array != nullptr,
+                           "nullable vector must use BinaryArray");
+                auto data_offset = binary_array->value_offset(0);
+                return FillFieldData(
+                    binary_array->value_data()->data() + data_offset,
+                    binary_array->null_bitmap_data(),
+                    binary_array->length(),
+                    binary_array->offset());
+            }
+            auto array_info =
+                GetDataInfoFromArray<arrow::FixedSizeBinaryArray,
+                                     arrow::Type::type::FIXED_SIZE_BINARY>(
+                    array);
+            return FillFieldData(array_info.first, array_info.second);
+        }
+        case DataType::VECTOR_SPARSE_U32_F32: {
+            if (!(array->type()->id() == arrow::Type::type::BINARY)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "inconsistent data type");
+            }
+            auto arr = std::dynamic_pointer_cast<arrow::BinaryArray>(array);
+            std::vector<knowhere::sparse::SparseRow<SparseValueType>> values;
+            values.reserve(element_count);
+
+            if (nullable_) {
+                for (int64_t i = 0; i < element_count; ++i) {
+                    if (arr->IsValid(i)) {
+                        auto view = arr->GetString(i);
+                        values.push_back(
+                            CopyAndWrapSparseRow(view.data(), view.size()));
+                    }
+                }
+                return FillFieldData(values.data(),
+                                     arr->null_bitmap_data(),
+                                     arr->length(),
+                                     arr->offset());
+            }
+            for (size_t index = 0; index < element_count; ++index) {
+                auto view = arr->GetString(index);
+                values.push_back(
+                    CopyAndWrapSparseRow(view.data(), view.size()));
+            }
+            return FillFieldData(values.data(), element_count);
+        }
+        case DataType::VECTOR_ARRAY: {
+            auto list_array =
+                std::dynamic_pointer_cast<arrow::ListArray>(array);
+            AssertInfo(list_array != nullptr,
+                       "Failed to cast to ListArray for VECTOR_ARRAY");
+            AssertInfo(nullable_ || list_array->null_count() == 0,
+                       "non-nullable VECTOR_ARRAY contains null rows");
+
+            auto vector_array_field =
+                dynamic_cast<FieldData<VectorArray>*>(this);
+            AssertInfo(vector_array_field != nullptr,
+                       "Failed to cast to FieldData<VectorArray>");
+            int64_t dim = vector_array_field->get_dim();
+            DataType element_type = vector_array_field->get_element_type();
+
+            AssertInfo(dim > 0, "Invalid dimension {} in VECTOR_ARRAY", dim);
+            AssertInfo(element_type != DataType::NONE,
+                       "Element type not set for VECTOR_ARRAY");
+
+            auto values_array = list_array->values();
+            std::vector<VectorArray> values;
+            values.reserve(nullable_ ? element_count - list_array->null_count()
+                                     : element_count);
+
+            switch (element_type) {
+                case DataType::VECTOR_FLOAT:
+                case DataType::VECTOR_BINARY:
+                case DataType::VECTOR_FLOAT16:
+                case DataType::VECTOR_BFLOAT16:
+                case DataType::VECTOR_INT8: {
+                    auto fixed_array =
+                        std::dynamic_pointer_cast<arrow::FixedSizeBinaryArray>(
+                            values_array);
+                    auto binary_array =
+                        std::dynamic_pointer_cast<arrow::BinaryArray>(
+                            values_array);
+                    AssertInfo(
+                        fixed_array != nullptr || binary_array != nullptr,
+                        "VECTOR_ARRAY expects list<FixedSizeBinary> or "
+                        "list<Binary>, got {}",
+                        array->type()->ToString());
+
+                    // Calculate bytes per vector using the unified function
+                    auto bytes_per_vec =
+                        milvus::vector_bytes_per_element(element_type, dim);
+
+                    AssertInfo(
+                        fixed_array == nullptr ||
+                            fixed_array->byte_width() == bytes_per_vec,
+                        "VECTOR_ARRAY width mismatch: expected {}, got {}",
+                        bytes_per_vec,
+                        fixed_array == nullptr ? 0 : fixed_array->byte_width());
+
+                    for (size_t index = 0; index < element_count; ++index) {
+                        if (nullable_ && list_array->IsNull(index)) {
+                            continue;
+                        }
+                        int64_t start_offset = list_array->value_offset(index);
+                        int64_t end_offset =
+                            list_array->value_offset(index + 1);
+                        int64_t num_vectors = end_offset - start_offset;
+
+                        if (fixed_array != nullptr) {
+                            for (int64_t i = 0; i < num_vectors; i++) {
+                                AssertInfo(
+                                    fixed_array->IsValid(start_offset + i),
+                                    "non-element-nullable VECTOR_ARRAY "
+                                    "contains null element");
+                            }
+                            auto data_size = num_vectors * bytes_per_vec;
+                            auto data_ptr =
+                                data_size > 0
+                                    ? std::make_unique<char[]>(data_size)
+                                    : nullptr;
+                            if (data_size > 0) {
+                                milvus::fastmem::FastMemcpy(
+                                    data_ptr.get(),
+                                    fixed_array->GetValue(start_offset),
+                                    data_size);
+                            }
+                            values.emplace_back(std::move(data_ptr),
+                                                num_vectors,
+                                                dim,
+                                                element_type);
+                            continue;
+                        }
+
+                        // The compact payload holds only the valid vectors;
+                        // size it by their count, not by the row's logical
+                        // length, so a row of null elements (such as an old
+                        // row of a sub-field added to a struct) allocates no
+                        // vector payload.
+                        int64_t valid_vectors = 0;
+                        for (int64_t i = 0; i < num_vectors; i++) {
+                            valid_vectors +=
+                                binary_array->IsValid(start_offset + i);
+                        }
+                        auto data_ptr = valid_vectors > 0
+                                            ? std::make_unique<char[]>(
+                                                  valid_vectors * bytes_per_vec)
+                                            : nullptr;
+                        std::vector<uint8_t> bitmap(
+                            (num_vectors + 7) / 8 + sizeof(uint64_t), 0);
+                        int64_t physical = 0;
+                        for (int64_t i = 0; i < num_vectors; i++) {
+                            const auto item = start_offset + i;
+                            if (binary_array->IsNull(item)) {
+                                continue;
+                            }
+                            auto value = binary_array->GetView(item);
+                            AssertInfo(value.size() == bytes_per_vec,
+                                       "VECTOR_ARRAY vector width {} "
+                                       "does not match {}",
+                                       value.size(),
+                                       bytes_per_vec);
+                            bitmap[i >> 3] |= uint8_t{1} << (i & 7);
+                            milvus::fastmem::FastMemcpy(
+                                data_ptr.get() + physical * bytes_per_vec,
+                                value.data(),
+                                bytes_per_vec);
+                            ++physical;
+                        }
+                        values.emplace_back(
+                            std::move(data_ptr),
+                            num_vectors,
+                            dim,
+                            element_type,
+                            TargetBitmapView(bitmap.data(), num_vectors),
+                            true);
+                    }
+                    break;
+                }
+                default:
+                    ThrowInfo(DataTypeInvalid,
+                              "Unsupported element type {} in VectorArray",
+                              GetDataTypeName(element_type));
+            }
+            if (nullable_) {
+                return FillFieldData(values.data(),
+                                     list_array->null_bitmap_data(),
+                                     element_count,
+                                     list_array->offset());
+            }
+            return FillFieldData(values.data(), element_count);
+        }
+        default: {
+            ThrowInfo(DataTypeInvalid,
+                      "{}::FillFieldData not support data type {}",
+                      GetName(),
+                      GetDataTypeName(data_type_));
+        }
+    }
+}
+
+// scalar data
+template class FieldDataImpl<bool, true>;
+template class FieldDataImpl<unsigned char, false>;
+template class FieldDataImpl<int8_t, true>;
+template class FieldDataImpl<int16_t, true>;
+template class FieldDataImpl<int32_t, true>;
+template class FieldDataImpl<int64_t, true>;
+template class FieldDataImpl<float, true>;
+template class FieldDataImpl<double, true>;
+template class FieldDataImpl<std::string, true>;
+template class FieldDataImpl<Json, true>;
+template class FieldDataImpl<Geometry, true>;
+template class FieldDataImpl<Array, true>;
+template class FieldDataImpl<ArrayValue, true>;
+
+// vector data
+template class FieldDataImpl<int8_t, false>;
+template class FieldDataImpl<float, false>;
+template class FieldDataImpl<float16, false>;
+template class FieldDataImpl<bfloat16, false>;
+template class FieldDataImpl<knowhere::sparse::SparseRow<SparseValueType>,
+                             true>;
+template class FieldDataImpl<VectorArray, true>;
+
+template <typename Type, bool is_type_entire_row>
+void
+FieldDataVectorImpl<Type, is_type_entire_row>::FillFieldData(
+    const void* field_data,
+    const uint8_t* valid_data,
+    ssize_t total_element_count,
+    ssize_t offset) {
+    AssertInfo(this->nullable_, "requires nullable to be true");
+    if (total_element_count == 0) {
+        return;
+    }
+
+    int64_t valid_count = 0;
+    if (valid_data) {
+        int64_t bit_start = offset;
+        int64_t bit_end = offset + total_element_count;
+
+        // Handle head: unaligned bits before first full byte
+        int64_t first_full_byte = (bit_start + 7) / 8;
+        int64_t last_full_byte = bit_end / 8;
+
+        // Process unaligned head bits
+        for (int64_t bit_idx = bit_start;
+             bit_idx < std::min(first_full_byte * 8, bit_end);
+             ++bit_idx) {
+            if ((valid_data[bit_idx >> 3] >> (bit_idx & 7)) & 1) {
+                valid_count++;
+            }
+        }
+
+        // Process aligned full bytes with popcount
+        for (int64_t byte_idx = first_full_byte; byte_idx < last_full_byte;
+             ++byte_idx) {
+            valid_count += bitset::detail::PopCountHelper<uint8_t>::count(
+                valid_data[byte_idx]);
+        }
+
+        // Process unaligned tail bits
+        for (int64_t bit_idx =
+                 std::max(last_full_byte * 8, first_full_byte * 8);
+             bit_idx < bit_end;
+             ++bit_idx) {
+            if ((valid_data[bit_idx >> 3] >> (bit_idx & 7)) & 1) {
+                valid_count++;
+            }
+        }
+    } else {
+        valid_count = total_element_count;
+    }
+
+    std::lock_guard lck(this->tell_mutex_);
+    resize_field_data(this->length_ + total_element_count,
+                      this->valid_count_ + valid_count);
+
+    if (valid_data) {
+        bitset::detail::ElementWiseBitsetPolicy<uint8_t>::op_copy(
+            valid_data,
+            offset,
+            this->valid_data_.data(),
+            this->length_,
+            total_element_count);
+    } else {
+        bitset::detail::ElementWiseBitsetPolicy<uint8_t>::op_fill(
+            this->valid_data_.data(), this->length_, total_element_count, true);
+    }
+
+    // update logical to physical offset mapping
+    l2p_mapping_.build(this->valid_data_.data(),
+                       this->valid_count_,
+                       this->length_,
+                       total_element_count,
+                       valid_count);
+
+    if (valid_count > 0) {
+        auto source_data = static_cast<const Type*>(field_data);
+        auto target_data = this->data_.data() + this->valid_count_ * this->dim_;
+        auto count = valid_count * this->dim_;
+        if constexpr (std::is_trivially_copyable_v<Type>) {
+            milvus::fastmem::FastMemcpy(
+                target_data, source_data, count * sizeof(Type));
+        } else {
+            std::copy_n(source_data, count, target_data);
+        }
+        this->valid_count_ += valid_count;
+    }
+
+    this->null_count_ += total_element_count - valid_count;
+    this->length_ += total_element_count;
+}
+
+// explicit instantiations for FieldDataVectorImpl
+template class FieldDataVectorImpl<uint8_t, false>;
+template class FieldDataVectorImpl<int8_t, false>;
+template class FieldDataVectorImpl<float, false>;
+template class FieldDataVectorImpl<float16, false>;
+template class FieldDataVectorImpl<bfloat16, false>;
+template class FieldDataVectorImpl<knowhere::sparse::SparseRow<SparseValueType>,
+                                   true>;
+
+namespace {
+
+template <typename T>
+FieldDataPtr
+InitScalarFieldDataWithLengthImpl(const DataType& type, int64_t length) {
+    FixedVector<T> values(length);
+    return std::make_shared<FieldData<T>>(type, false, std::move(values));
+}
+
+}  // namespace
+
+FieldDataPtr
+InitScalarFieldData(const DataType& type, bool nullable, int64_t cap_rows) {
+    switch (type) {
+        case DataType::BOOL:
+            return std::make_shared<FieldData<bool>>(type, nullable, cap_rows);
+        case DataType::INT8:
+            return std::make_shared<FieldData<int8_t>>(
+                type, nullable, cap_rows);
+        case DataType::INT16:
+            return std::make_shared<FieldData<int16_t>>(
+                type, nullable, cap_rows);
+        case DataType::INT32:
+            return std::make_shared<FieldData<int32_t>>(
+                type, nullable, cap_rows);
+        case DataType::INT64:
+            return std::make_shared<FieldData<int64_t>>(
+                type, nullable, cap_rows);
+        case DataType::FLOAT:
+            return std::make_shared<FieldData<float>>(type, nullable, cap_rows);
+        case DataType::DOUBLE:
+            return std::make_shared<FieldData<double>>(
+                type, nullable, cap_rows);
+        case DataType::TIMESTAMPTZ:
+            return std::make_shared<FieldData<int64_t>>(
+                type, nullable, cap_rows);
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+            return std::make_shared<FieldData<std::string>>(
+                type, nullable, cap_rows);
+        case DataType::JSON:
+            return std::make_shared<FieldData<Json>>(type, nullable, cap_rows);
+        case DataType::GEOMETRY:
+            return std::make_shared<FieldData<std::string>>(
+                type, nullable, cap_rows);
+        default:
+            ThrowInfo(DataTypeInvalid,
+                      "InitScalarFieldData not support data type {}",
+                      GetDataTypeName(type));
+    }
+}
+
+FieldDataPtr
+InitScalarFieldDataWithLength(const DataType& type, int64_t length) {
+    switch (type) {
+        case DataType::BOOL:
+            return InitScalarFieldDataWithLengthImpl<bool>(type, length);
+        case DataType::INT8:
+            return InitScalarFieldDataWithLengthImpl<int8_t>(type, length);
+        case DataType::INT16:
+            return InitScalarFieldDataWithLengthImpl<int16_t>(type, length);
+        case DataType::INT32:
+            return InitScalarFieldDataWithLengthImpl<int32_t>(type, length);
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            return InitScalarFieldDataWithLengthImpl<int64_t>(type, length);
+        case DataType::FLOAT:
+            return InitScalarFieldDataWithLengthImpl<float>(type, length);
+        case DataType::DOUBLE:
+            return InitScalarFieldDataWithLengthImpl<double>(type, length);
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT:
+        case DataType::GEOMETRY:
+            return InitScalarFieldDataWithLengthImpl<std::string>(type, length);
+        case DataType::JSON:
+            return InitScalarFieldDataWithLengthImpl<Json>(type, length);
+        default:
+            ThrowInfo(DataTypeInvalid,
+                      "InitScalarFieldDataWithLength not support data type {}",
+                      GetDataTypeName(type));
+    }
+}
+
+void
+ResizeScalarFieldData(const DataType& type,
+                      int64_t new_num_rows,
+                      FieldDataPtr& field_data) {
+    switch (type) {
+        case DataType::BOOL: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<bool>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::INT8: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<int8_t>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::INT16: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<int16_t>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::INT32: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<int32_t>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::TIMESTAMPTZ:
+        case DataType::INT64: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<int64_t>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::FLOAT: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<float>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::DOUBLE: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<double>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::STRING:
+        case DataType::VARCHAR:
+        case DataType::TEXT: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<std::string>>(field_data);
+            AssertInfo(inner_field_data != nullptr,
+                       "Failed to cast field_data to FieldData<std::string>");
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        case DataType::JSON: {
+            auto inner_field_data =
+                std::dynamic_pointer_cast<FieldData<Json>>(field_data);
+            inner_field_data->resize_field_data(new_num_rows);
+            return;
+        }
+        default:
+            ThrowInfo(DataTypeInvalid,
+                      "ResizeScalarFieldData not support data type {}",
+                      GetDataTypeName(type));
+    }
+}
+
+}  // namespace milvus

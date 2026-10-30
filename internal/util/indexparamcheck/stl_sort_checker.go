@@ -1,0 +1,60 @@
+package indexparamcheck
+
+import (
+	"github.com/samber/lo"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// STLSORTChecker checks if a STL_SORT index can be built.
+type STLSORTChecker struct {
+	scalarIndexChecker
+}
+
+var validSTLSORTJSONCastTypes = []string{"DOUBLE", "VARCHAR"}
+
+func (c *STLSORTChecker) CheckTrain(dataType schemapb.DataType, elementType schemapb.DataType, params map[string]string) error {
+	if typeutil.IsJSONType(dataType) {
+		castType, exist := params[common.JSONCastTypeKey]
+		if !exist {
+			return merr.WrapErrParameterMissing(common.JSONCastTypeKey, "json index must specify cast type")
+		}
+		if !lo.Contains(validSTLSORTJSONCastTypes, castType) && !IsJSONArrayCastType(castType) {
+			return merr.WrapErrParameterInvalidMsg("json_cast_type %v is not supported for STL_SORT index", castType)
+		}
+		if err := checkJSONCastFunction(castType, params); err != nil {
+			return err
+		}
+		if _, exist := params[common.JSONPathKey]; !exist {
+			return merr.WrapErrParameterMissing(common.JSONPathKey, "json index must specify json path")
+		}
+	}
+	return c.scalarIndexChecker.CheckTrain(dataType, elementType, params)
+}
+
+func (c *STLSORTChecker) CheckValidDataType(indexType IndexType, field *schemapb.FieldSchema) error {
+	dataType := field.GetDataType()
+	if typeutil.IsArrayType(dataType) {
+		elemType := field.GetElementType()
+		nested := typeutil.IsStructSubField(field.GetName())
+		if typeutil.IsArithmetic(elemType) || typeutil.IsStringType(elemType) ||
+			(nested && typeutil.IsTimestamptzType(elemType)) || (!nested && elemType == schemapb.DataType_Bool) {
+			return nil
+		}
+		return merr.WrapErrParameterInvalidMsg("STL_SORT does not support array element type %s", elemType)
+	}
+	if typeutil.IsJSONType(dataType) {
+		return nil
+	}
+	if !typeutil.IsArithmetic(dataType) && !typeutil.IsStringType(dataType) && !typeutil.IsTimestamptzType(dataType) {
+		return merr.WrapErrParameterInvalidMsg("STL_SORT are only supported on numeric, varchar or timestamptz field, got %s", field.GetDataType())
+	}
+	return nil
+}
+
+func newSTLSORTChecker() *STLSORTChecker {
+	return &STLSORTChecker{}
+}

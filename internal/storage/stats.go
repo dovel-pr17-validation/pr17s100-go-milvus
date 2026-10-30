@@ -1,0 +1,655 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package storage
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"io"
+	"maps"
+	"math"
+	"path"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/util/bloomfilter"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+)
+
+// PrimaryKeyStats contains rowsWithToken data for pk column
+type PrimaryKeyStats struct {
+	FieldID int64                            `json:"fieldID"`
+	Max     int64                            `json:"max"` // useless, will delete
+	Min     int64                            `json:"min"` // useless, will delete
+	BFType  bloomfilter.BFType               `json:"bfType"`
+	BF      bloomfilter.BloomFilterInterface `json:"bf"`
+	PkType  int64                            `json:"pkType"`
+	MaxPk   PrimaryKey                       `json:"maxPk"`
+	MinPk   PrimaryKey                       `json:"minPk"`
+}
+
+// PkStatsConfig freezes the capacity and Bloom filter settings used to build
+// primary-key statistics. Callers that omit it keep the legacy paramtable
+// behavior.
+type PkStatsConfig struct {
+	Capacity              int64
+	BloomFilterType       string
+	MaxBloomFalsePositive float64
+}
+
+// UnmarshalJSON unmarshal bytes to PrimaryKeyStats
+func (stats *PrimaryKeyStats) UnmarshalJSON(data []byte) error {
+	var messageMap map[string]*json.RawMessage
+	err := json.Unmarshal(data, &messageMap)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(*messageMap["fieldID"], &stats.FieldID)
+	if err != nil {
+		return err
+	}
+
+	stats.PkType = int64(schemapb.DataType_Int64)
+	if value, ok := messageMap["pkType"]; ok && value != nil {
+		var typeValue int64
+		err = json.Unmarshal(*value, &typeValue)
+		if err != nil {
+			return err
+		}
+		// valid pkType
+		if typeValue > 0 {
+			stats.PkType = typeValue
+		}
+	}
+
+	switch schemapb.DataType(stats.PkType) {
+	case schemapb.DataType_Int64:
+		stats.MaxPk = &Int64PrimaryKey{}
+		stats.MinPk = &Int64PrimaryKey{}
+
+		// Compatible with versions that only support int64 type primary keys
+		err = json.Unmarshal(*messageMap["max"], &stats.Max)
+		if err != nil {
+			return err
+		}
+		err = stats.MaxPk.SetValue(stats.Max)
+		if err != nil {
+			return err
+		}
+
+		err = json.Unmarshal(*messageMap["min"], &stats.Min)
+		if err != nil {
+			return err
+		}
+		err = stats.MinPk.SetValue(stats.Min)
+		if err != nil {
+			return err
+		}
+	case schemapb.DataType_VarChar:
+		stats.MaxPk = &VarCharPrimaryKey{}
+		stats.MinPk = &VarCharPrimaryKey{}
+	default:
+		return merr.WrapErrServiceInternalMsg("Invalid PK Data Type")
+	}
+
+	if maxPkMessage, ok := messageMap["maxPk"]; ok && maxPkMessage != nil {
+		err = json.Unmarshal(*maxPkMessage, stats.MaxPk)
+		if err != nil {
+			return err
+		}
+	}
+
+	if minPkMessage, ok := messageMap["minPk"]; ok && minPkMessage != nil {
+		err = json.Unmarshal(*minPkMessage, stats.MinPk)
+		if err != nil {
+			return err
+		}
+	}
+
+	bfType := bloomfilter.BasicBF
+	if bfTypeMessage, ok := messageMap["bfType"]; ok && bfTypeMessage != nil {
+		err := json.Unmarshal(*bfTypeMessage, &bfType)
+		if err != nil {
+			return err
+		}
+		stats.BFType = bfType
+	}
+
+	if bfMessage, ok := messageMap["bf"]; ok && bfMessage != nil {
+		bf, err := bloomfilter.UnmarshalJSON(*bfMessage, bfType)
+		if err != nil {
+			mlog.Warn(context.TODO(), "Failed to unmarshal bloom filter, use AlwaysTrueBloomFilter instead of return err", mlog.Err(err))
+			bf = bloomfilter.AlwaysTrueBloomFilter
+		}
+		stats.BF = bf
+	}
+
+	return nil
+}
+
+func (stats *PrimaryKeyStats) UpdateByMsgs(msgs FieldData) {
+	switch schemapb.DataType(stats.PkType) {
+	case schemapb.DataType_Int64:
+		data := msgs.(*Int64FieldData).Data
+		if len(data) < 1 {
+			// return error: msgs must has one element at least
+			return
+		}
+
+		b := make([]byte, 8)
+		for _, int64Value := range data {
+			pk := NewInt64PrimaryKey(int64Value)
+			stats.UpdateMinMax(pk)
+			common.Endian.PutUint64(b, uint64(int64Value))
+			stats.BF.Add(b)
+		}
+	case schemapb.DataType_VarChar:
+		data := msgs.(*StringFieldData).Data
+		if len(data) < 1 {
+			// return error: msgs must has one element at least
+			return
+		}
+
+		for _, str := range data {
+			pk := NewVarCharPrimaryKey(str)
+			stats.UpdateMinMax(pk)
+			stats.BF.AddString(str)
+		}
+	default:
+		// TODO::
+	}
+}
+
+func (stats *PrimaryKeyStats) Update(pk PrimaryKey) {
+	stats.UpdateMinMax(pk)
+	switch schemapb.DataType(stats.PkType) {
+	case schemapb.DataType_Int64:
+		data := pk.GetValue().(int64)
+		b := make([]byte, 8)
+		common.Endian.PutUint64(b, uint64(data))
+		stats.BF.Add(b)
+	case schemapb.DataType_VarChar:
+		data := pk.GetValue().(string)
+		stats.BF.AddString(data)
+	default:
+		mlog.Warn(context.TODO(), "Update pk stats with invalid data type")
+	}
+}
+
+// updatePk update minPk and maxPk value
+func (stats *PrimaryKeyStats) UpdateMinMax(pk PrimaryKey) {
+	if stats.MinPk == nil {
+		stats.MinPk = pk
+	} else if stats.MinPk.GT(pk) {
+		stats.MinPk = pk
+	}
+
+	if stats.MaxPk == nil {
+		stats.MaxPk = pk
+	} else if stats.MaxPk.LT(pk) {
+		stats.MaxPk = pk
+	}
+}
+
+func NewPrimaryKeyStats(fieldID, pkType, rowNum int64) (*PrimaryKeyStats, error) {
+	config := PkStatsConfig{
+		Capacity:              rowNum,
+		BloomFilterType:       paramtable.Get().CommonCfg.BloomFilterType.GetValue(),
+		MaxBloomFalsePositive: paramtable.Get().CommonCfg.MaxBloomFalsePositive.GetAsFloat(),
+	}
+	// Preserve the legacy constructor's tolerant fallback: an unknown or
+	// non-Basic/Blocked bloom type used to degrade to BlockedBloomFilter. The
+	// strict validation lives in NewPrimaryKeyStatsWithConfig for Import V3
+	// WriterSpec, where the bloom type must be frozen and validated.
+	if bfType := bloomfilter.BFTypeFromString(config.BloomFilterType); bfType != bloomfilter.BasicBF && bfType != bloomfilter.BlockedBF {
+		mlog.Warn(context.TODO(), "unsupported bloom filter type, falling back to BlockedBloomFilter",
+			mlog.String("type", config.BloomFilterType))
+		config.BloomFilterType = bloomfilter.BlockBFName
+	}
+	return NewPrimaryKeyStatsWithConfig(fieldID, pkType, config)
+}
+
+func NewPrimaryKeyStatsWithConfig(fieldID, pkType int64, config PkStatsConfig) (*PrimaryKeyStats, error) {
+	if config.Capacity <= 0 {
+		return nil, merr.WrapErrParameterInvalidMsg("zero or negative row num %d", config.Capacity)
+	}
+	bfType := bloomfilter.BFTypeFromString(config.BloomFilterType)
+	if bfType != bloomfilter.BasicBF && bfType != bloomfilter.BlockedBF {
+		return nil, merr.WrapErrParameterInvalidMsg("unsupported bloom filter type %q", config.BloomFilterType)
+	}
+	if config.MaxBloomFalsePositive <= 0 || config.MaxBloomFalsePositive >= 1 {
+		return nil, merr.WrapErrParameterInvalidMsg("invalid bloom false positive rate %v", config.MaxBloomFalsePositive)
+	}
+	return &PrimaryKeyStats{
+		FieldID: fieldID,
+		PkType:  pkType,
+		BFType:  bfType,
+		BF: bloomfilter.NewBloomFilterWithType(
+			uint(config.Capacity),
+			config.MaxBloomFalsePositive,
+			config.BloomFilterType),
+	}, nil
+}
+
+// StatsWriter writes stats to buffer
+type StatsWriter struct {
+	buffer []byte
+}
+
+// GetBuffer returns buffer
+func (sw *StatsWriter) GetBuffer() []byte {
+	return sw.buffer
+}
+
+// GenerateList writes Stats slice to buffer
+func (sw *StatsWriter) GenerateList(stats []*PrimaryKeyStats) error {
+	b, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	sw.buffer = b
+	return nil
+}
+
+// Generate writes Stats to buffer
+func (sw *StatsWriter) Generate(stats *PrimaryKeyStats) error {
+	b, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	sw.buffer = b
+	return nil
+}
+
+// GenerateByData writes Int64Stats or StringStats from @msgs with @fieldID to @buffer
+func (sw *StatsWriter) GenerateByData(fieldID int64, pkType schemapb.DataType, msgs FieldData) error {
+	bfType := paramtable.Get().CommonCfg.BloomFilterType.GetValue()
+	stats := &PrimaryKeyStats{
+		FieldID: fieldID,
+		PkType:  int64(pkType),
+		BFType:  bloomfilter.BFTypeFromString(bfType),
+		BF: bloomfilter.NewBloomFilterWithType(
+			uint(msgs.RowNum()),
+			paramtable.Get().CommonCfg.MaxBloomFalsePositive.GetAsFloat(),
+			bfType),
+	}
+
+	stats.UpdateByMsgs(msgs)
+	return sw.Generate(stats)
+}
+
+// StatsReader reads stats
+type StatsReader struct {
+	buffer []byte
+}
+
+// SetBuffer sets buffer
+func (sr *StatsReader) SetBuffer(buffer []byte) {
+	sr.buffer = buffer
+}
+
+// GetInt64Stats returns buffer as PrimaryKeyStats
+func (sr *StatsReader) GetPrimaryKeyStats() (*PrimaryKeyStats, error) {
+	stats := &PrimaryKeyStats{}
+	err := json.Unmarshal(sr.buffer, &stats)
+	if err != nil {
+		return nil, merr.WrapErrDataIntegrity(err, "PrimaryKeyStats unmarshal failed")
+	}
+
+	return stats, nil
+}
+
+// GetInt64Stats returns buffer as PrimaryKeyStats
+func (sr *StatsReader) GetPrimaryKeyStatsList() ([]*PrimaryKeyStats, error) {
+	stats := []*PrimaryKeyStats{}
+	err := json.Unmarshal(sr.buffer, &stats)
+	if err != nil {
+		return nil, merr.WrapErrDataIntegrity(err, "PrimaryKeyStats list unmarshal failed")
+	}
+
+	return stats, nil
+}
+
+type BM25Stats struct {
+	rowsWithToken map[uint32]int32 // mapping token => row num include token
+	numRow        int64            // total row num
+	numToken      int64            // total token num
+}
+
+const BM25VERSION int32 = 0
+
+func NewBM25Stats() *BM25Stats {
+	return &BM25Stats{
+		rowsWithToken: map[uint32]int32{},
+	}
+}
+
+func NewBM25StatsWithBytes(bytes []byte) (*BM25Stats, error) {
+	stats := NewBM25Stats()
+	err := stats.Deserialize(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (m *BM25Stats) Append(rows ...map[uint32]float32) {
+	for _, row := range rows {
+		for key, value := range row {
+			m.rowsWithToken[key] += 1
+			m.numToken += int64(value)
+		}
+
+		m.numRow += 1
+	}
+}
+
+func (m *BM25Stats) AppendFieldData(datas ...*SparseFloatVectorFieldData) {
+	for _, data := range datas {
+		m.AppendBytes(data.GetContents()...)
+	}
+}
+
+// Update BM25Stats by sparse vector bytes
+func (m *BM25Stats) AppendBytes(datas ...[]byte) {
+	for _, data := range datas {
+		dim := typeutil.SparseFloatRowElementCount(data)
+		for i := 0; i < dim; i++ {
+			index := typeutil.SparseFloatRowIndexAt(data, i)
+			value := typeutil.SparseFloatRowValueAt(data, i)
+			m.rowsWithToken[index] += 1
+			m.numToken += int64(value)
+		}
+		m.numRow += 1
+	}
+}
+
+func (m *BM25Stats) NumRow() int64 {
+	return m.numRow
+}
+
+func (m *BM25Stats) NumToken() int64 {
+	return m.numToken
+}
+
+func (m *BM25Stats) Merge(meta *BM25Stats) {
+	for key, value := range meta.rowsWithToken {
+		m.rowsWithToken[key] += value
+	}
+	m.numRow += meta.NumRow()
+	m.numToken += meta.numToken
+}
+
+func (m *BM25Stats) Minus(meta *BM25Stats) {
+	for key, value := range meta.rowsWithToken {
+		m.rowsWithToken[key] -= value
+		if m.rowsWithToken[key] == 0 {
+			delete(m.rowsWithToken, key)
+		}
+	}
+	m.numRow -= meta.numRow
+	m.numToken -= meta.numToken
+}
+
+// ValidateDelta checks a complete replacement before the caller publishes it.
+func (m *BM25Stats) ValidateDelta(add, remove *BM25Stats) error {
+	rows := m.numRow + add.numRow - remove.numRow
+	tokens := m.numToken + add.numToken - remove.numToken
+	if rows < 0 || tokens < 0 {
+		return merr.WrapErrDataIntegrityMsg("negative BM25 aggregate counts after replacement")
+	}
+	for _, delta := range []*BM25Stats{remove, add} {
+		for key := range delta.rowsWithToken {
+			count := int64(m.rowsWithToken[key]) + int64(add.rowsWithToken[key]) - int64(remove.rowsWithToken[key])
+			if count < 0 || count > rows || count > math.MaxInt32 {
+				return merr.WrapErrDataIntegrityMsg("invalid BM25 document frequency for token %d", key)
+			}
+		}
+	}
+	return nil
+}
+
+// ApplyDelta applies a previously validated delta under the owner's write lock.
+// Remove zero-frequency keys and compact maps after a large vocabulary reduction.
+func (m *BM25Stats) ApplyDelta(add, remove *BM25Stats) {
+	previousSize := len(m.rowsWithToken)
+	m.Minus(remove)
+	m.Merge(add)
+	for key := range remove.rowsWithToken {
+		if m.rowsWithToken[key] == 0 {
+			delete(m.rowsWithToken, key)
+		}
+	}
+	if previousSize > 1024 && len(m.rowsWithToken)*2 < previousSize {
+		compact := make(map[uint32]int32, len(m.rowsWithToken))
+		maps.Copy(compact, m.rowsWithToken)
+		m.rowsWithToken = compact
+	}
+}
+
+func (m *BM25Stats) Clone() *BM25Stats {
+	return &BM25Stats{
+		rowsWithToken: maps.Clone(m.rowsWithToken),
+		numRow:        m.numRow,
+		numToken:      m.numToken,
+	}
+}
+
+func (m *BM25Stats) Serialize() ([]byte, error) {
+	buffer := bytes.NewBuffer(make([]byte, 0, len(m.rowsWithToken)*8+20))
+
+	if err := binary.Write(buffer, common.Endian, BM25VERSION); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buffer, common.Endian, m.numRow); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Write(buffer, common.Endian, m.numToken); err != nil {
+		return nil, err
+	}
+
+	for key, value := range m.rowsWithToken {
+		if err := binary.Write(buffer, common.Endian, key); err != nil {
+			return nil, err
+		}
+
+		if err := binary.Write(buffer, common.Endian, value); err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO ADD Serialize Time Metric
+	return buffer.Bytes(), nil
+}
+
+func (m *BM25Stats) SerializeToWriter(w io.Writer) error {
+	if err := binary.Write(w, common.Endian, BM25VERSION); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, common.Endian, m.numRow); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, common.Endian, m.numToken); err != nil {
+		return err
+	}
+
+	for key, value := range m.rowsWithToken {
+		if err := binary.Write(w, common.Endian, key); err != nil {
+			return err
+		}
+
+		if err := binary.Write(w, common.Endian, value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *BM25Stats) Deserialize(bs []byte) error {
+	if len(bs) < 20 {
+		// Match EOF at a header field boundary and truncation within a field.
+		if len(bs) == 0 || len(bs) == 4 || len(bs) == 12 {
+			return io.EOF
+		}
+		return io.ErrUnexpectedEOF
+	}
+
+	dim := (len(bs) - 20) / 8
+	if dim > 0 && len(m.rowsWithToken) == 0 {
+		m.rowsWithToken = make(map[uint32]int32, dim)
+	}
+	for i := 0; i < dim; i++ {
+		off := 20 + i*8
+		key := common.Endian.Uint32(bs[off : off+4])
+		value := int32(common.Endian.Uint32(bs[off+4 : off+8]))
+		m.rowsWithToken[key] += value
+	}
+
+	m.numRow += int64(common.Endian.Uint64(bs[4:12]))
+	m.numToken += int64(common.Endian.Uint64(bs[12:20]))
+	return nil
+}
+
+func (m *BM25Stats) BuildIDF(tf []byte) (idf []byte) {
+	numElements := typeutil.SparseFloatRowElementCount(tf)
+	idf = make([]byte, len(tf))
+	for idx := 0; idx < numElements; idx++ {
+		key := typeutil.SparseFloatRowIndexAt(tf, idx)
+		value := typeutil.SparseFloatRowValueAt(tf, idx)
+		typeutil.SparseFloatRowSetAt(idf, idx, key, bm25TermIDF(value, m.numRow, m.rowsWithToken[key]))
+	}
+	return idf
+}
+
+// bm25TermIDF weights a query term by its IDF given the total row count and the rows containing the term.
+func bm25TermIDF(value float32, numRow int64, nq int32) float32 {
+	return value * float32(math.Log(1+(float64(numRow)-float64(nq)+0.5)/(float64(nq)+0.5)))
+}
+
+func (m *BM25Stats) GetAvgdl() float64 {
+	if m.numRow == 0 || m.numToken == 0 {
+		return 0
+	}
+	return float64(m.numToken) / float64(m.numRow)
+}
+
+// DeserializeBloomFilterStats auto-detects compound vs default stats format
+// from the paths and deserializes accordingly. Compound format is detected
+// when any path has a basename matching CompoundStatsType.LogIdx().
+func DeserializeBloomFilterStats(paths []string, blobs []*Blob) ([]*PrimaryKeyStats, error) {
+	for i, p := range paths {
+		_, logidx := path.Split(p)
+		if logidx == CompoundStatsType.LogIdx() {
+			return DeserializeStatsList(blobs[i])
+		}
+	}
+	return DeserializeStats(blobs)
+}
+
+// MemSize estimates the in-memory size of this BM25Stats in bytes.
+// len(map) is O(1) in Go (reads hmap.count directly). Per-entry cost is configurable
+// via queryNode.idfOracle.bm25StatsBytesPerEntry.
+func (m *BM25Stats) MemSize() int64 {
+	// Fixed overhead: numRow(8) + numToken(8) + map header (~100B)
+	return 120 + int64(len(m.rowsWithToken))*paramtable.Get().QueryNodeCfg.BM25StatsBytesPerEntry.GetAsInt64()
+}
+
+// DeserializeFromReader reads BM25 stats from an io.Reader and accumulates into self.
+// Unlike Deserialize([]byte), this does not require knowing the total size upfront.
+func (m *BM25Stats) DeserializeFromReader(r io.Reader) error {
+	var header [20]byte
+	if n, err := io.ReadFull(r, header[:]); err != nil {
+		// Preserve the historical binary.Read EOF at complete field boundaries.
+		if err == io.ErrUnexpectedEOF && (n == 4 || n == 12) {
+			return io.EOF
+		}
+		return err
+	}
+
+	m.numRow += int64(common.Endian.Uint64(header[4:12]))
+	m.numToken += int64(common.Endian.Uint64(header[12:20]))
+
+	buf := make([]byte, 4*1024)
+	remaining := 0
+	for {
+		n, err := r.Read(buf[remaining:])
+		n += remaining
+		end := n - n%8
+		for off := 0; off < end; off += 8 {
+			key := common.Endian.Uint32(buf[off : off+4])
+			value := int32(common.Endian.Uint32(buf[off+4 : off+8]))
+			m.rowsWithToken[key] += value
+		}
+		// Carry an incomplete record into the next read.
+		remaining = copy(buf, buf[end:n])
+		if err != nil {
+			if err == io.EOF {
+				// The historical decoder returned EOF when the value was absent.
+				if remaining == 4 {
+					return io.EOF
+				}
+				if remaining != 0 {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// DeserializeStats deserializes @blobs as []*PrimaryKeyStats
+func DeserializeStats(blobs []*Blob) ([]*PrimaryKeyStats, error) {
+	results := make([]*PrimaryKeyStats, 0, len(blobs))
+	for _, blob := range blobs {
+		if len(blob.Value) == 0 {
+			continue
+		}
+		sr := &StatsReader{}
+		sr.SetBuffer(blob.Value)
+		stats, err := sr.GetPrimaryKeyStats()
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, stats)
+	}
+	return results, nil
+}
+
+func DeserializeStatsList(blob *Blob) ([]*PrimaryKeyStats, error) {
+	if len(blob.Value) == 0 {
+		return []*PrimaryKeyStats{}, nil
+	}
+	sr := &StatsReader{}
+	sr.SetBuffer(blob.Value)
+	stats, err := sr.GetPrimaryKeyStatsList()
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}

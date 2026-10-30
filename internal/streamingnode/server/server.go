@@ -1,0 +1,110 @@
+package server
+
+import (
+	"context"
+	"fmt"
+
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/queryplan"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/service"
+	snviewquery "github.com/milvus-io/milvus/internal/streamingnode/server/viewquery"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/snview"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/walmanager"
+	"github.com/milvus-io/milvus/internal/util/analyzer"
+	"github.com/milvus-io/milvus/internal/util/fileresource"
+	"github.com/milvus-io/milvus/internal/util/function/chain/expr"
+	"github.com/milvus-io/milvus/internal/util/initcore"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+	_ "github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/kafka"
+	_ "github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/pulsar"
+	_ "github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/rmq"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+)
+
+// Server is the streamingnode server.
+type Server struct {
+	// session of current server.
+	session    *sessionutil.Session
+	grpcServer *grpc.Server
+
+	// service level instances.
+	handlerService service.HandlerService
+	managerService service.ManagerService
+
+	// basic component instances.
+	walManager walmanager.Manager
+}
+
+// Init initializes the streamingnode server.
+func (s *Server) init() {
+	mlog.Info(context.TODO(), "init streamingnode server...")
+	// Install on-demand resource loading before WAL recovery registers function runners.
+	fileresource.InitManager(resource.Resource().ChunkManager(), fileresource.GetLocalMode())
+	fileresource.SetResourceFetcher(resource.Resource().ChunkManager(), fetchFileResources)
+	// init all basic components.
+	s.initBasicComponent()
+
+	// init all service.
+	s.initService()
+
+	if err := analyzer.InitOptions(); err != nil {
+		panic(fmt.Sprintf("init analyzer options failed, %+v", err))
+	}
+
+	mlog.Info(context.TODO(), "init query segcore...")
+	if err := initcore.InitQueryNode(context.TODO()); err != nil {
+		panic(fmt.Sprintf("init query node segcore failed, %+v", err))
+	}
+
+	mlog.Info(context.TODO(), "streamingnode server initialized")
+}
+
+// Stop stops the streamingnode server.
+func (s *Server) Stop() {
+	mlog.Info(context.TODO(), "stopping streamingnode server...")
+	mlog.Info(context.TODO(), "close wal manager...")
+	s.walManager.Close()
+	expr.CloseXGBoostModels()
+	fileresource.CloseAnalyzerResourceManager()
+	mlog.Info(context.TODO(), "release streamingnode resources...")
+	resource.Release()
+	mlog.Info(context.TODO(), "streamingnode server stopped")
+}
+
+// initBasicComponent initialize all underlying dependency for streamingnode.
+func (s *Server) initBasicComponent() {
+	var err error
+	s.walManager, err = walmanager.OpenManager()
+	if err != nil {
+		panic(fmt.Sprintf("open wal manager failed, %+v", err))
+	}
+	// Register the wal manager to the local registry.
+	registry.RegisterLocalWALManager(s.walManager)
+}
+
+// initService initializes the grpc service.
+func (s *Server) initService() {
+	writeBufferManager := resource.Resource().WriteBufferManager()
+	registry.RegisterLocalReleaseManualFlushPreparer(service.NewReleaseManualFlushPreparer(s.walManager, writeBufferManager))
+	s.handlerService = service.NewHandlerService(s.walManager)
+	s.managerService = service.NewManagerService(s.walManager)
+	s.registerGRPCService(s.grpcServer)
+}
+
+// registerGRPCService register all grpc service to grpc server.
+func (s *Server) registerGRPCService(grpcServer *grpc.Server) {
+	streamingpb.RegisterStreamingNodeHandlerServiceServer(grpcServer, s.handlerService)
+	streamingpb.RegisterStreamingNodeManagerServiceServer(grpcServer, s.managerService)
+	viewpb.RegisterViewSyncServiceServer(grpcServer, snview.NewPChannelViewSyncServer(s.walManager))
+	viewpb.RegisterViewQueryServiceServer(grpcServer, snview.NewPChannelViewQueryServer(
+		s.walManager,
+		snviewquery.NewScheduler(snviewquery.NewDirectSegmentTaskExecutor(paramtable.GetNodeID())),
+	))
+	viewpb.RegisterQueryPlanServiceServer(grpcServer, queryplan.NewServer(s.walManager))
+}
